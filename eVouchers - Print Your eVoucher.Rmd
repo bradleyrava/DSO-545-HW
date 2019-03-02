@@ -1,0 +1,1770 @@
+---
+title: "3 Different Tweedie Simulations - Score Function Change"
+author: "Bradley Rava"
+date: "2/3/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Packages we will be using in the simulation
+library(splines)
+library(plyr)
+library(knitr)
+library(parallel)
+library(quadprog)
+```
+
+## Simulation 1 - $v(x) = log(\tilde{p})$
+
+```{r functions for all simulations}
+myns <- function (x, df = NULL, knots = NULL, intercept = FALSE, 
+                  Boundary.knots = range(x), deriv=0) 
+{
+  nx <- names(x)
+  x <- as.vector(x)
+  nax <- is.na(x)
+  if (nas <- any(nax)) 
+    x <- x[!nax]
+  if (!missing(Boundary.knots)) {
+    Boundary.knots <- sort(Boundary.knots)
+    outside <- (ol <- x < Boundary.knots[1L]) | (or <- x > 
+                                                   Boundary.knots[2L])
+  }
+  else outside <- FALSE
+  if (!is.null(df) && is.null(knots)) {
+    nIknots <- df - 1L - intercept
+    if (nIknots < 0L) {
+      nIknots <- 0L
+      warning(gettextf("'df' was too small; have used %d", 
+                       1L + intercept), domain = NA)
+    }
+    knots <- if (nIknots > 0L) {
+      knots <- seq.int(0, 1, length.out = nIknots + 2L)[-c(1L, 
+                                                           nIknots + 2L)]
+      quantile(x[!outside], knots)
+    }
+  }
+  else nIknots <- length(knots)
+  Aknots <- sort(c(rep(Boundary.knots, 4L), knots))
+  if (any(outside)) {
+    basis <- array(0, c(length(x), nIknots + 4L))
+    if (any(ol)) {
+      k.pivot <- Boundary.knots[1L]
+      xl <- cbind(1, x[ol] - k.pivot)
+      tt <- splineDesign(Aknots, rep(k.pivot, 2L), 4, c(0, 
+                                                        1), derivs=deriv)
+      basis[ol, ] <- xl %*% tt
+    }
+    if (any(or)) {
+      k.pivot <- Boundary.knots[2L]
+      xr <- cbind(1, x[or] - k.pivot)
+      tt <- splineDesign(Aknots, rep(k.pivot, 2L), 4, c(0, 
+                                                        1), derivs=deriv)
+      basis[or, ] <- xr %*% tt
+    }
+    if (any(inside <- !outside)) 
+      basis[inside, ] <- splineDesign(Aknots, x[inside], 
+                                      4, derivs=deriv)
+  }
+  else basis <- splineDesign(Aknots, x, 4, derivs=deriv)
+  const <- splineDesign(Aknots, Boundary.knots, 4, c(2, 2))
+  if (!intercept) {
+    const <- const[, -1, drop = FALSE]
+    basis <- basis[, -1, drop = FALSE]
+  }
+  qr.const <- qr(t(const))
+  basis <- as.matrix((t(qr.qty(qr.const, t(basis))))[, -(1L:2L), 
+                                                     drop = FALSE])
+  n.col <- ncol(basis)
+  if (nas) {
+    nmat <- matrix(NA, length(nax), n.col)
+    nmat[!nax, ] <- basis
+    basis <- nmat
+  }
+  dimnames(basis) <- list(nx, 1L:n.col)
+  a <- list(degree = 3L, knots = if (is.null(knots)) numeric() else knots, 
+            Boundary.knots = Boundary.knots, intercept = intercept)
+  attributes(basis) <- c(attributes(basis), a)
+  class(basis) <- c("ns", "basis", "matrix")
+  basis
+}
+
+# Create function that assigns the train rows after test rows have been chosen.
+assign_train <- function(test_index) {
+  partitions_train <- partitions 
+  partitions_train[test_index] <- NA
+  partitions_train <- unlist(partitions_train)
+  partitions_train <- partitions_train[!is.na(partitions_train)]
+  return(partitions_train)
+}
+
+# Given a value of p, assign the closest prob in our bucket
+# If unconstrained then fix first if statement
+assign_prob <- function(p) {
+  # Which bucket does p land in
+  if (p == 1) {
+    # Just a quick fix but not good for long
+    return(bucket_prob[length(bucket_prob)])
+    #return(0.99)
+  }
+  else {
+    index <- which((p < bucket_index) == TRUE)[1]
+    if (index > length(bucket_prob)) {
+      index <- length(bucket_prob)
+    }
+    return(bucket_prob[index])
+  }
+}
+
+## Closeness of our probability vectors
+close.true <- function(true, est) {
+  terms <- ((true - est) / est)^2
+  return(mean(terms))
+}
+
+close.true.median <- function(true, est) {
+  terms <- ((true - est) / est)^2
+  return(median(terms))
+}
+
+close.true.terms <- function(true, est) {
+  terms <- ((true - est) / est)^2
+  return(terms)
+}
+
+close.true.binomial <- function(est) {
+  # Calculate wins with true p
+  log.term <- sum(log(est[win_index]))
+  minus.log.term <- sum(log(1-est[lose_index]))
+  sum <- log.term+minus.log.term
+  return(sum)
+}
+
+p.tilde.gen <- function(p, n) {
+  p.tilde <- rbeta(n, (1/gamma_param)*(p/(1-p)), (1/gamma_param))
+  p.tilde.star <- p + p^zz*(p.tilde-p)
+  return(p.tilde.star)
+}
+
+## Function to produce the james stein estimate for a given value of sigma
+JS_sigma <- function(p.hat, const) {
+  M.hat <- mean(p.hat)
+  n <- length(p.hat)
+  js <- M.hat + (1-const) * (p.hat-M.hat)
+  return(js)
+}
+```
+
+```{r fixed parameters for all simulations}
+#### Fixed Parameters ####
+gamma_grid <- seq(0.00001, 0.005, by=0.0001)
+lambda_grid <- 10^seq(-4, 4, by=0.1)
+const_grid <- seq(0, 1, by = 0.001)
+trunc <- exp(-10)
+
+## Training number
+n.prob1 <- 10000
+## Testing number
+n.prob2 <- 10000
+## Level of error
+gamma_param <- 1/500
+## Tuning parameter q for new prob estimates
+zz <- 0.05
+
+###########
+nits <- 100
+###########
+```
+
+```{r functions specific for simulation 1}
+## QuadProg Quadratic Programming FCN
+eta_min_fcn <- function(lambda, gamma) {
+  ## Define vars used below
+  n <- nrow(basis_1.temp)
+  one <- rep(1, length = n)
+  
+  ## Set up into the correct form
+  Dmat <- 2*((1/n) * basis_sum.temp + lambda*omega)
+  dvec <- t(-(2/n) * t(t(basis_1.temp)%*%one))
+  
+  ## We need to add the constraints
+  x <- ptl
+  rows.min <- which(pt == trunc)
+  x.min <- x[rows.min] 
+  b.vec1 <- (trunc - exp(x.min)/(1-exp(x.min)))*(1/gamma) + exp(x.min)/(1+exp(x.min))
+  
+  #x.nonmin <- p.tilde.log[-rows.min]
+  b.vec2 <- ((-exp(x)/(1+exp(x))^2) * (1-gamma)) * (1/gamma)
+  
+  Amat.temp <- rbind(basis_0.temp[rows.min,], basis_1.temp)
+  Amat <- t(Amat.temp)
+  bvec <- c(b.vec1, b.vec2)
+  
+  return(solve.QP(Dmat, dvec, Amat, bvec, meq=0)$solution)
+}
+
+## Function to make the loops easier to understand
+tweed.adj.fcn <- function(lambda, gamma, probs.df, mle = FALSE, quad.prog = FALSE, EC.Odds = TRUE) {
+  if (quad.prog == FALSE) {
+    eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda) * omega, tol = 1e-100) %*% sum_b_d1
+  }
+  else {
+    eta_hat <- eta_min_fcn(lambda, gamma)
+  }
+  score_hat <- basis_0%*%eta_hat
+  score_hat_d1 <- basis_1%*%eta_hat
+  
+  p.tweedieie.ratio <- probs$odds.tilde + gamma * (probs$p.tilde*score_hat+1 - probs$odds.tilde)
+  
+  odds.hat.var <- gamma^2*probs$p.tilde* (probs$p.tilde*score_hat_d1+score_hat+
+                                            (1-gamma)/(gamma*(1-probs$p.tilde)^2))
+  
+  odds.hat <- p.tweedieie.ratio + odds.hat.var
+  p.hat <- odds.hat / (1+odds.hat)
+  
+  if (mle == FALSE) {
+    ifelse(EC.Odds, Q.gamma <- close.true(probs.df$odds, odds.hat), 
+           Q.gamma <- close.true(probs.df$p, p.hat))
+  }
+  else {
+    est <- p.hat
+    Q.gamma <- close.true.binomial(est)
+  }
+  return(Q.gamma)
+}
+
+## Function to produce tweedie odds estimates from a given lambda and gamma
+tweedie.odds.est <- function(lambda, gamma, quad.prog = FALSE) {
+  if (quad.prog == FALSE) {
+    eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda) * omega, tol = 1e-100) %*% sum_b_d1
+  }
+  else {
+    eta_hat <- eta_min_fcn(lambda, gamma)
+  }
+  
+  score_hat <- basis_0%*%eta_hat
+  score_hat_d1 <- basis_1%*%eta_hat
+  
+  p.tweedieie.ratio.min <- probs$odds.tilde + gamma*(score_hat - probs$odds.tilde)
+  odds.tweedie.sq <- gamma^2*(score_hat_d1+(((1/gamma)-1)/(1-probs$p.tilde))*probs$odds.tilde)
+  odds.hat.var <- odds.tweedie.sq / p.tweedieie.ratio.min
+  
+  odds.hat <- p.tweedieie.ratio.min + odds.hat.var
+  
+  return(odds.hat)
+}
+```
+
+```{r simulation 1 - v(log(tilde{p}))}
+## Containers to store observations
+lambda_storage.odds.a <- matrix(NA, ncol=nits, nrow=4)
+rownames(lambda_storage.odds.a) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+gamma_storage.odds.a <- matrix(NA, ncol=nits, nrow=4)
+rownames(gamma_storage.odds.a) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+sigma_storage.odds.a <- matrix(NA, ncol=nits, nrow=2)
+rownames(sigma_storage.odds.a) <- c("true", "est")
+
+lambda_storage.p.a <- matrix(NA, ncol=nits, nrow=4)
+rownames(lambda_storage.p.a) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+gamma_storage.p.a <- matrix(NA, ncol=nits, nrow=4)
+rownames(gamma_storage.p.a) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+sigma_storage.p.a <- matrix(NA, ncol=nits, nrow=2)
+rownames(sigma_storage.p.a) <- c("true", "est")
+
+## Containers for errors using EC of odds.hat
+err.naive.odds <- vector(mode="numeric", length=nits)
+err.tweedie.1.odds <- vector(mode="numeric", length=nits)
+err.tweedie.2.odds <- vector(mode="numeric", length=nits)
+err.tweedie.3.odds <- vector(mode="numeric", length=nits)
+err.tweedie.4.odds <- vector(mode="numeric", length=nits)
+err.js.ptrue.odds <- vector(mode="numeric", length=nits)
+err.js.mle.odds <- vector(mode="numeric", length=nits)
+err.oracle.odds <- vector(mode="numeric", length=nits)
+
+## Containers for errors using EC of p.hat
+err.naive.p <- vector(mode="numeric", length=nits)
+err.tweedie.1.p <- vector(mode="numeric", length=nits)
+err.tweedie.2.p <- vector(mode="numeric", length=nits)
+err.tweedie.3.p <- vector(mode="numeric", length=nits)
+err.tweedie.4.p <- vector(mode="numeric", length=nits)
+err.js.ptrue.p <- vector(mode="numeric", length=nits)
+err.js.mle.p <- vector(mode="numeric", length=nits)
+err.oracle.p <- vector(mode="numeric", length=nits)
+
+## Containers to store data used
+data.train <- list()
+data.test <- list()
+
+## EC Terms Storage
+ec.odds.a <- list()
+ec.p.a <- list()
+
+set.seed(091118)
+for (q in 1:nits) {
+  ## Generate the probability matrix
+  p <- runif(n.prob1, 0, 0.5)
+  p.tilde <- p.tilde.gen(p, n.prob1)
+  
+  # adjust for overly extreme probs
+  p.tilde[p.tilde < trunc] <- trunc
+  
+  # Create the true and error odds
+  odds <- p / (1-p)
+  odds.tilde <- p.tilde / (1-p.tilde)
+  
+  # Sufficient statistic 
+  p.tilde.log <- log(p.tilde)
+  
+  # Store everything in a dataframe for sorting 
+  probs <- cbind.data.frame(p, p.tilde, odds, odds.tilde, p.tilde.log)
+  probs <- probs[order(probs$p.tilde.log),]
+  
+  ## For MLE Later -- Calculate the z_i's ahead of time
+  win_var <- rbinom(length(probs$p.tilde), 1, probs$p)
+  win_index <- which(win_var == 1)
+  lose_index <- which(win_var == 0)
+  
+  ## Generate basis function / omega matrix from log(p.tilde)
+  # Get Knot Locations
+  num_quantiles <- 50
+  divisions <- seq(0, 1, by=1/num_quantiles)
+  quantiles <- quantile(probs$p.tilde.log, probs = divisions)
+  quantiles <- unique(sort(quantiles))
+  quantiles[1] <- quantiles[1] + 0.001
+  quantiles[length(quantiles)] <- quantiles[length(quantiles)] - 0.001
+  knot.range <- range(probs$p.tilde.log)
+  
+  # Generate the basis matrix and its correspoding 1st and 2nd deriv's
+  basis_0 <- myns(probs$p.tilde.log, knots = quantiles, intercept = TRUE)
+  basis_1 <- myns(probs$p.tilde.log, knots = quantiles, deriv = 1, intercept = TRUE)
+  basis_2 <- myns(probs$p.tilde.log, knots = quantiles, deriv = 2, intercept = TRUE)
+  
+  # We also want to calculate Omega on a fine grid of points
+  fine_grid <- seq(min(probs$p.tilde.log), max(probs$p.tilde.log), by=0.001)
+  basis_fine_grid <- myns(fine_grid, knots = quantiles, intercept = TRUE)
+  basis_fine_grid_d2 <- myns(fine_grid, knots = quantiles, deriv = 2, intercept = TRUE)
+  omega <- (1/nrow(basis_fine_grid)) * (t(basis_fine_grid_d2) %*% basis_fine_grid_d2)
+  
+  ## Grid for the optimization algorithm
+  ptl <- seq(log(trunc), log(0.5), by = 0.001)
+  pt <- exp(ptl)
+  basis_0.temp <- myns(ptl, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_1.temp <- myns(ptl, knots = quantiles, deriv = 1, intercept = TRUE, Boundary.knots = knot.range)
+  basis_sum.temp <- t(basis_0.temp)%*%basis_0.temp
+  
+  #### Adjustment 1: Risk function for lambda and grid for gamma. True p ####
+  ## CV SET UP to get min value of lambda from risk function
+  # Randomize the rows
+  rows <- 1:nrow(basis_0)
+  rows_rand <- rows[sample(rows)]
+  
+  # # Declate the number of groups that we want
+  n.group <- 10
+  # # Return a list with 10 approx equal vectors of rows. 
+  partitions <- split(rows_rand,
+                      cut(rows_rand,quantile(rows_rand,(0:n.group)/n.group),
+                          include.lowest=TRUE, labels=FALSE))
+  
+  ### Here we are going to pick the best value of lambda through cross validation
+  risk_cvsplit <- lapply(1:n.group, function(i) {
+    test.rows <- partitions[[i]]
+    train.rows <- assign_train(i)
+    b_g <- basis_0[train.rows,]
+    b_g_d1 <- basis_1[train.rows,]
+    b_g_d2 <- basis_2[train.rows,]
+    
+    # I can do the below without thinking about lambda because it doesn't depend on it (only on test and train).
+    # Calculate every term in the sum
+    basis_sum <- t(b_g)%*%b_g
+    
+    # calculate the column wise sum of our the first derivative of our basis matrix
+    sum_b_d1 <- t(b_g_d1)%*%rep(1,nrow(b_g_d1))
+    
+    # Now, we need to do this inversion for every value of lambda
+    eta_g <- matrix(nrow = ncol(b_g), ncol = length(lambda_grid))
+    for (i in 1:length(lambda_grid)) {
+      l <- lambda_grid[i]
+      eta_g[,i] <- -solve(basis_sum + (nrow(b_g)*l) * omega, tol = 1e-100) %*% sum_b_d1
+    }
+    
+    # Now, let's consider the test data
+    b_g_test <- basis_0[test.rows,]
+    b_g_d1_test <- basis_1[test.rows,]
+    
+    # We just need to calculate the basis sum part again.
+    basis_sum <- t(b_g_test)%*%b_g_test
+    
+    # Now, we can calculate the risk where eta was calculatd on our test data and we take the
+    # basis matrix to calculate the score function from our test data
+    one_vector <- as.vector(t(rep(1, nrow(b_g_test))))
+    
+    # Returns a vector of the risk for every value of lambda for a single test and train dataset
+    risk_hat <- apply(eta_g, 2, function(eta) {
+      return((1/nrow(b_g_test)) * t(eta) %*% basis_sum %*% eta
+             + (2/nrow(b_g_test)) * one_vector%*%b_g_d1_test%*%eta)
+    })
+    # We now want to loop over this for all permutations of our cross validation
+    return(risk_hat)
+  })
+  
+  r_cv_split_matrix <- do.call(cbind, risk_cvsplit)
+  r_cv_split_vec <- apply(r_cv_split_matrix, 1, mean)
+  names(r_cv_split_vec) <- lambda_grid
+  
+  # Get the value of lambda that corresponds to the smallest risk
+  lambda_min <- as.numeric(names(r_cv_split_vec[which(r_cv_split_vec 
+                                                      == min(r_cv_split_vec))[1]]))
+  lambda_storage.odds.a[c(1,2),q] <- lambda_min 
+  lambda_storage.p.a[c(1,2),q] <- lambda_min 
+
+  # Get an estimate of the score function with lambda_min
+  basis_sum <- t(basis_0)%*%basis_0
+  sum_b_d1 <- t(basis_1)%*%rep(1,nrow(basis_1))
+  eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda_storage.odds.a[1,q]) * omega, tol = 1e-100) %*% sum_b_d1
+  score_hat_risk <- basis_0%*%eta_hat
+  score_hat_risk_d1 <- basis_1%*%eta_hat
+  
+  ## Optimal Gamma from Risk True p
+  optimal_gamma_check.true <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.odds.a[1,q], g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = TRUE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.true == min(optimal_gamma_check.true))]
+  gamma_storage.odds.a[1,q] <- gamma_min
+  
+  optimal_gamma_check.true <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.p.a[1,q], g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = FALSE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.true == min(optimal_gamma_check.true))]
+  gamma_storage.p.a[1,q] <- gamma_min
+  
+  ## Optimal Gamma from Risk Est p
+  optimal_gamma_check.est <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.odds.a[1,q], g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = TRUE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.est == max(optimal_gamma_check.est))]
+  gamma_storage.odds.a[2,q] <- gamma_min
+  
+  optimal_gamma_check.est <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.p.a[1,q], g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.est == max(optimal_gamma_check.est))]
+  gamma_storage.p.a[2,q] <- gamma_min
+  
+  #### Adjustment 2 & 4: Grid search for both lambda and gamma. True and est p ####
+  q.grid <- lapply(lambda_grid, function(l) {
+    ## True p
+    gamma.true <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = TRUE)
+    })
+    names(gamma.true) <- gamma_grid  
+    
+    ## MLE 
+    gamma.est <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.est) <- gamma_grid
+    
+    return(cbind(gamma.true, gamma.est))
+  })
+  
+  g.true.list <- lapply(q.grid, function(i) i[,1])
+  g.est.list <- lapply(q.grid, function(i) i[,2])
+  q.grid.true <- do.call(cbind, g.true.list)
+  q.grid.est <- do.call(cbind, g.est.list)
+  
+  index.true.min <- which(q.grid.true == min(q.grid.true), arr.ind = TRUE)
+  index.est.max <- which(q.grid.est == max(q.grid.est), arr.ind = TRUE)
+  
+  ## Get estimated value of gamma and lambda
+  gamma_min <- gamma_grid[index.true.min[1]] 
+  lambda_min <- lambda_grid[index.true.min[2]]
+  lambda_storage.odds.a[3,q] <- lambda_min
+  gamma_storage.odds.a[3,q] <- gamma_min
+  
+  gamma_min <- gamma_grid[index.est.max[1]] 
+  lambda_min <- lambda_grid[index.est.max[2]]
+  lambda_storage.odds.a[4,q] <- lambda_min
+  gamma_storage.odds.a[4,q] <- gamma_min
+  
+  ########
+  
+  q.grid <- lapply(lambda_grid, function(l) {
+    ## True p
+    gamma.true <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.true) <- gamma_grid  
+    
+    ## MLE 
+    gamma.est <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.est) <- gamma_grid
+    
+    return(cbind(gamma.true, gamma.est))
+  })
+  
+  g.true.list <- lapply(q.grid, function(i) i[,1])
+  g.est.list <- lapply(q.grid, function(i) i[,2])
+  q.grid.true <- do.call(cbind, g.true.list)
+  q.grid.est <- do.call(cbind, g.est.list)
+  
+  index.true.min <- which(q.grid.true == min(q.grid.true), arr.ind = TRUE)
+  index.est.max <- which(q.grid.est == max(q.grid.est), arr.ind = TRUE)
+  
+  ## Get estimated value of gamma and lambda
+  gamma_min <- gamma_grid[index.true.min[1]] 
+  lambda_min <- lambda_grid[index.true.min[2]]
+  lambda_storage.p.a[3,q] <- lambda_min
+  gamma_storage.p.a[3,q] <- gamma_min
+  
+  gamma_min <- gamma_grid[index.est.max[1]] 
+  lambda_min <- lambda_grid[index.est.max[2]]
+  lambda_storage.p.a[4,q] <- lambda_min
+  gamma_storage.p.a[4,q] <- gamma_min
+  
+  #### James Stein ####
+  
+  ## JS 1 - True p
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    js.ratio <- probs.js / (1-probs.js)
+    terms <- ((probs$odds / js.ratio) - 1)^2
+    return(sum(terms))
+  })
+  min_element <- which(gridsearch.js == min(gridsearch.js, na.rm = TRUE))
+  sigma_min.true <- const_grid[min_element]
+  sigma_storage.odds.a[1,q] <- sigma_min.true
+  
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    terms <- ((probs$p / probs.js) - 1)^2
+    return(sum(terms))
+  })
+  min_element <- which(gridsearch.js == min(gridsearch.js, na.rm = TRUE))
+  sigma_min.true <- const_grid[min_element]
+  sigma_storage.p.a[1,q] <- sigma_min.true
+  
+  ## JS 2 - MLE
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    bin.log <- close.true.binomial(probs.js)
+    return(bin.log)
+  })
+  max_element <- which(gridsearch.js == max(gridsearch.js, na.rm = TRUE))
+  sigma_min.mle <- const_grid[max_element]
+  sigma_storage.odds.a[2,q] <- sigma_min.mle
+  sigma_storage.p.a[2,q] <- sigma_min.mle
+  
+  ## Store training probabilities
+  data.train[[q]] <- probs
+  
+  #############################################################
+  #### Generate new probabilities to test these parameters ####
+  #############################################################
+  
+  p <- runif(n.prob2, 0, 0.5)
+  p.tilde <- p.tilde.gen(p, n.prob2)
+  
+  # adjust for overly extreme probs
+  p.tilde[p.tilde < trunc] <- trunc
+  
+  # Create the true and error odds
+  odds <- p / (1-p)
+  odds.tilde <- p.tilde / (1-p.tilde)
+  
+  # Sufficient statistic
+  p.tilde.log <- log(p.tilde)
+  
+  # Store everything in a dataframe for sorting
+  probs <- cbind.data.frame(p, p.tilde, odds, odds.tilde, p.tilde.log)
+  probs <- probs[order(probs$p.tilde.log),]
+  
+  # Generate the basis matrix and its correspoding 1st and 2nd deriv's
+  basis_0 <- myns(probs$p.tilde.log, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_1 <- myns(probs$p.tilde.log, knots = quantiles, deriv = 1, intercept = TRUE, Boundary.knots = knot.range)
+  basis_2 <- myns(probs$p.tilde.log, knots = quantiles, deriv = 2, intercept = TRUE, Boundary.knots = knot.range)
+  
+  # We also want to calculate Omega on a fine grid of points
+  fine_grid <- seq(min(probs$p.tilde.log), max(probs$p.tilde.log), by=0.001)
+  basis_fine_grid <- myns(fine_grid, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_fine_grid_d2 <- myns(fine_grid, knots = quantiles, deriv = 2, intercept = TRUE, Boundary.knots = knot.range)
+  omega <- (1/nrow(basis_fine_grid)) * (t(basis_fine_grid_d2) %*% basis_fine_grid_d2)
+  basis_sum <- t(basis_0)%*%basis_0
+  sum_b_d1 <- t(basis_1)%*%rep(1,nrow(basis_1))
+  
+  #### Create our adjusted probability estimates
+  ## (1) Risk Lambda - Grid Gamma True p
+  probs$odds.hat.s1.odds <- tweedie.odds.est(lambda_storage.odds.a[1,q], gamma_storage.odds.a[1,q], quad.prog = TRUE)
+  probs$odds.hat.s1.p <- tweedie.odds.est(lambda_storage.p.a[1,q], gamma_storage.p.a[1,q], quad.prog = TRUE)
+
+  ## (2) Risk Lambda - Grid Gamma MLE
+  probs$odds.hat.s2.odds <- tweedie.odds.est(lambda_storage.odds.a[2,q], gamma_storage.odds.a[2,q], quad.prog = TRUE)
+  probs$odds.hat.s2.p <- tweedie.odds.est(lambda_storage.p.a[2,q], gamma_storage.p.a[2,q], quad.prog = TRUE)
+
+  ## (3) Grid Lambda and Gamma TRUE
+  probs$odds.hat.s3.odds <- tweedie.odds.est(lambda_storage.odds.a[3,q], gamma_storage.odds.a[3,q], quad.prog = TRUE)
+  probs$odds.hat.s3.p <- tweedie.odds.est(lambda_storage.p.a[3,q], gamma_storage.p.a[3,q], quad.prog = TRUE)
+  
+  ## (4) Grid Lambda and Gamma TRUE
+  probs$odds.hat.s4.odds <- tweedie.odds.est(lambda_storage.odds.a[4,q], gamma_storage.odds.a[4,q], quad.prog = TRUE)
+  probs$odds.hat.s4.p <- tweedie.odds.est(lambda_storage.p.a[4,q], gamma_storage.p.a[4,q], quad.prog = TRUE)
+  
+  ## (5) JS Odds
+  probs$prob.js.true.sigma_o <- JS_sigma(probs$p.tilde, sigma_storage.odds.a[1,q])
+  probs$odds.js.true.sigma_o <- probs$prob.js.true.sigma_o / (1-probs$prob.js.true.sigma_o)
+  probs$prob.js.mle.sigma_o <- JS_sigma(probs$p.tilde, sigma_storage.odds.a[2,q])
+  probs$odds.js.mle.sigma_o <- probs$prob.js.mle.sigma_o / (1-probs$prob.js.mle.sigma_o)
+
+  ## (6) JS P
+  probs$prob.js.true.sigma_p <- JS_sigma(probs$p.tilde, sigma_storage.p.a[1,q])
+  probs$odds.js.true.sigma_p <- probs$prob.js.true.sigma_p / (1-probs$prob.js.true.sigma_p)
+  probs$prob.js.mle.sigma_p <- JS_sigma(probs$p.tilde, sigma_storage.p.a[2,q])
+  probs$odds.js.mle.sigma_p <- probs$prob.js.mle.sigma_p / (1-probs$prob.js.mle.sigma_p)
+  
+  ## Empty containers for the oracle to remember to do this later
+  probs$oracle.tweedie <- rep(NA, n.prob2)
+  probs$oracle.odds.hat <- rep(NA, n.prob2)
+  probs$oracle.p.hat <- rep(NA, n.prob2)
+  
+  ## Get Error for all of our estimates against true odds
+  err.naive.odds[q] <- close.true(probs$odds, probs$odds.tilde)
+  err.tweedie.1.odds[q] <- close.true(probs$odds, probs$odds.hat.s1.odds)
+  err.tweedie.2.odds[q] <- close.true(probs$odds, probs$odds.hat.s2.odds)
+  err.tweedie.3.odds[q] <- close.true(probs$odds, probs$odds.hat.s3.odds)
+  err.tweedie.4.odds[q] <- close.true(probs$odds, probs$odds.hat.s4.odds)
+  err.js.ptrue.odds[q] <- close.true(probs$odds, probs$odds.js.true.sigma_o)
+  err.js.mle.odds[q] <- close.true(probs$odds, probs$odds.js.mle.sigma_o)
+  err.oracle.odds[q] <- close.true(probs$odds, probs$oracle.odds.hat)
+  
+  ## Get Error for all of our estimates against true p
+  err.naive.p[q] <- close.true(probs$p, probs$p.tilde)
+  err.tweedie.1.p[q] <- close.true(probs$p, probs$odds.hat.s1.p / (1+probs$odds.hat.s1.p))
+  err.tweedie.2.p[q] <- close.true(probs$p, probs$odds.hat.s2.p / (1+probs$odds.hat.s2.p))
+  err.tweedie.3.p[q] <- close.true(probs$p, probs$odds.hat.s3.p / (1+probs$odds.hat.s3.p))
+  err.tweedie.4.p[q] <- close.true(probs$p, probs$odds.hat.s4.p / (1+probs$odds.hat.s4.p))
+  err.js.ptrue.p[q] <- close.true(probs$p, probs$prob.js.true.sigma_p)
+  err.js.mle.p[q] <- close.true(probs$p, probs$prob.js.mle.sigma_p)
+  err.oracle.p[q] <- close.true(probs$p, probs$oracle.odds.hat)
+  
+  ## Store test probabilities
+  data.test[[q]] <- probs
+  
+  ## Store EC Terms
+  ec.odds.a[[q]] <- cbind(close.true.terms(probs$odds, probs$odds.tilde),
+                   close.true.terms(probs$odds, probs$odds.hat.s1.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s2.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s3.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s4.odds),
+                   close.true.terms(probs$odds, probs$odds.js.mle.sigma_o))
+  
+  ec.p.a[[q]] <- cbind(close.true.terms(probs$p, probs$p.tilde),
+                   close.true.terms(probs$p, probs$odds.hat.s1.p / (1+probs$odds.hat.s1.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s2.p / (1+probs$odds.hat.s2.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s3.p / (1+probs$odds.hat.s3.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s4.p / (1+probs$odds.hat.s4.p)),
+                   close.true.terms(probs$p, probs$prob.js.mle.sigma_p))
+  
+  ## Erase later
+  print(q)
+}
+
+## Generate a summary matrix
+mean.err.matrix <- as.data.frame(matrix(nrow = 8, ncol = 6))
+colnames(mean.err.matrix) <- c("Odds.hat Mean", "Odds.hat SD Mean", "Median of Odds.hat Means", "P.hat Mean", "P.hat SD Mean", "Median of P.hat Means")
+rownames(mean.err.matrix) <- c("Naive", "Tweedie - Risk & true p", "Tweedie - Risk & MLE",
+                               "Tweedie - Grid & True p", "Tweedie - Grid & MLE", 
+                               "JS - True p", "JS - MLE",
+                               "Oracle")
+mean.err.matrix[1,] <- c(mean(err.naive.odds), sqrt((var(err.naive.odds)) / nits), median(err.naive.odds),
+                         mean(err.naive.p), sqrt((var(err.naive.p)) / nits), median(err.naive.p)) 
+mean.err.matrix[2,] <- c(mean(err.tweedie.1.odds), sqrt((var(err.tweedie.1.odds)) / nits), median(err.tweedie.1.odds),
+                         mean(err.tweedie.1.p), sqrt((var(err.tweedie.1.p)) / nits), median(err.tweedie.1.p)) 
+mean.err.matrix[3,] <- c(mean(err.tweedie.2.odds), sqrt((var(err.tweedie.2.odds)) / nits), median(err.tweedie.2.odds),
+                         mean(err.tweedie.2.p), sqrt((var(err.tweedie.2.p)) / nits), median(err.tweedie.2.p)) 
+mean.err.matrix[4,] <- c(mean(err.tweedie.3.odds), sqrt((var(err.tweedie.3.odds)) / nits), median(err.tweedie.3.odds),
+                         mean(err.tweedie.3.p), sqrt((var(err.tweedie.3.p)) / nits), median(err.tweedie.3.p)) 
+mean.err.matrix[5,] <- c(mean(err.tweedie.4.odds), sqrt((var(err.tweedie.4.odds)) / nits), median(err.tweedie.4.odds),
+                         mean(err.tweedie.4.p), sqrt((var(err.tweedie.4.p)) / nits), median(err.tweedie.4.p)) 
+mean.err.matrix[6,] <- c(mean(err.js.ptrue.odds), sqrt((var(err.js.ptrue.odds)) / nits), median(err.js.ptrue.odds),
+                         mean(err.js.ptrue.p), sqrt((var(err.js.ptrue.p)) / nits), median(err.js.ptrue.p)) 
+mean.err.matrix[7,] <- c(mean(err.js.mle.odds), sqrt((var(err.js.mle.odds)) / nits), median(err.js.mle.odds),
+                         mean(err.js.mle.p), sqrt((var(err.js.mle.p)) / nits), median(err.js.mle.p)) 
+mean.err.matrix[8,] <- c(mean(err.oracle.odds), sqrt((var(err.oracle.odds)) / nits), median(err.oracle.odds),
+                         mean(err.oracle.odds), sqrt((var(err.oracle.odds)) / nits), median(err.oracle.odds)) 
+
+err.matrix.ptilde.log <- kable(mean.err.matrix, caption = "Unif(0, 0.5) prior")
+print(err.matrix.ptilde.log)
+```
+
+
+## Simulation 2
+
+
+```{r functions specific for simulation 2}
+## QuadProg Quadratic Programming FCN
+eta_min_fcn <- function(lambda, gamma) {
+  ## Define vars used below
+  n <- nrow(basis_1.temp)
+  one <- rep(1, length = n)
+  
+  ## Set up into the correct form
+  Dmat <- 2*((1/n) * basis_sum.temp + lambda*omega)
+  dvec <- t(-(2/n) * t(t(basis_1.temp)%*%one))
+  
+  ## We need to add the constraints
+  x <- pt
+  rows.min <- which(pt == trunc)
+  x.min <- x[rows.min] 
+  
+  b.vec1 <- ((trunc - x.min/(1-x.min))*(1/gamma) + (x.min/(1-x.min))-1)*(1/x.min)
+  b.vec2 <- (1/(1-x)^2)*(1-(1/gamma))
+  
+  Amat.part1 <- basis_0.temp[rows.min,]
+  Amat.part2 <- (basis_0.temp + x*basis_1.temp)
+  Amat.temp <- rbind(Amat.part1, Amat.part2)
+  Amat <- t(Amat.temp)
+  bvec <- c(b.vec1, b.vec2)
+  
+  return(solve.QP(Dmat, dvec, Amat, bvec, meq=0)$solution)
+}
+
+## Function to make the loops easier to understand
+tweed.adj.fcn <- function(lambda, gamma, probs.df, mle = FALSE, quad.prog = FALSE, EC.Odds = TRUE) {
+  if (quad.prog == FALSE) {
+    eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda) * omega, tol = 1e-100) %*% sum_b_d1
+  }
+  else {
+    eta_hat <- eta_min_fcn(lambda, gamma)
+  }
+  score_hat <- basis_0%*%eta_hat
+  score_hat_d1 <- basis_1%*%eta_hat
+  
+  p.tweedieie.ratio <- probs$odds.tilde + gamma * (probs$p.tilde*score_hat+1 - probs$odds.tilde)
+  
+  odds.hat.var <- gamma^2*probs$p.tilde* (probs$p.tilde*score_hat_d1+score_hat+
+                                            (1-gamma)/(gamma*(1-probs$p.tilde)^2))
+  
+  odds.hat <- p.tweedieie.ratio + odds.hat.var
+  p.hat <- odds.hat / (1+odds.hat)
+  
+  if (mle == FALSE) {
+    ifelse(EC.Odds, Q.gamma <- close.true(probs.df$odds, odds.hat), 
+           Q.gamma <- close.true(probs.df$p, p.hat))
+  }
+  else {
+    est <- odds.hat / (1+odds.hat)
+    Q.gamma <- close.true.binomial(est)
+  }
+  return(Q.gamma)
+}
+
+## Function to produce tweedie odds estimates from a given lambda and gamma
+tweedie.odds.est <- function(lambda, gamma, quad.prog = FALSE) {
+  if (quad.prog == FALSE) {
+    eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda) * omega, tol = 1e-100) %*% sum_b_d1
+  }
+  else {
+    eta_hat <- eta_min_fcn(lambda, gamma)
+  }
+  
+  score_hat <- basis_0%*%eta_hat
+  score_hat_d1 <- basis_1%*%eta_hat
+  
+  p.tweedieie.ratio <- probs$odds.tilde + gamma * (probs$p.tilde*score_hat+1 - probs$odds.tilde)
+  
+  odds.hat.var <- gamma^2*probs$p.tilde* (probs$p.tilde*score_hat_d1+score_hat+
+                                            (1-gamma)/(gamma*(1-probs$p.tilde)^2))
+  odds.hat <- p.tweedieie.ratio + odds.hat.var
+  
+  return(odds.hat)
+}
+```
+
+```{r simulation 2 - v(tilde{p})}
+## Containers to store observations
+lambda_storage.odds.b <- matrix(NA, ncol=nits, nrow=4)
+rownames(lambda_storage.odds.b) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+gamma_storage.odds.b <- matrix(NA, ncol=nits, nrow=4)
+rownames(gamma_storage.odds.b) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+sigma_storage.odds.b <- matrix(NA, ncol=nits, nrow=2)
+rownames(sigma_storage.odds.b) <- c("true", "est")
+
+lambda_storage.p.b <- matrix(NA, ncol=nits, nrow=4)
+rownames(lambda_storage.p.b) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+gamma_storage.p.b <- matrix(NA, ncol=nits, nrow=4)
+rownames(gamma_storage.p.b) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+sigma_storage.p.b <- matrix(NA, ncol=nits, nrow=2)
+rownames(sigma_storage.p.b) <- c("true", "est")
+
+## Containers for errors using EC of odds.hat
+err.naive.odds <- vector(mode="numeric", length=nits)
+err.tweedie.1.odds <- vector(mode="numeric", length=nits)
+err.tweedie.2.odds <- vector(mode="numeric", length=nits)
+err.tweedie.3.odds <- vector(mode="numeric", length=nits)
+err.tweedie.4.odds <- vector(mode="numeric", length=nits)
+err.js.ptrue.odds <- vector(mode="numeric", length=nits)
+err.js.mle.odds <- vector(mode="numeric", length=nits)
+err.oracle.odds <- vector(mode="numeric", length=nits)
+
+## Containers for errors using EC of p.hat
+err.naive.p <- vector(mode="numeric", length=nits)
+err.tweedie.1.p <- vector(mode="numeric", length=nits)
+err.tweedie.2.p <- vector(mode="numeric", length=nits)
+err.tweedie.3.p <- vector(mode="numeric", length=nits)
+err.tweedie.4.p <- vector(mode="numeric", length=nits)
+err.js.ptrue.p <- vector(mode="numeric", length=nits)
+err.js.mle.p <- vector(mode="numeric", length=nits)
+err.oracle.p <- vector(mode="numeric", length=nits)
+
+## Containers to store data used
+data.train <- list()
+data.test <- list()
+
+## EC Terms Storage
+ec.odds.b <- list()
+ec.p.b <- list()
+
+set.seed(091118)
+for (q in 1:nits) {
+  ## Generate the probability matrix
+  p <- runif(n.prob1, 0, 0.5)
+  p.tilde <- p.tilde.gen(p, n.prob1)
+  
+  # adjust for overly extreme probs
+  p.tilde[p.tilde < trunc] <- trunc
+  
+  # Create the true and error odds
+  odds <- p / (1-p)
+  odds.tilde <- p.tilde / (1-p.tilde)
+  
+  # Sufficient statistic 
+  p.tilde.log <- log(p.tilde)
+  
+  # Store everything in a dataframe for sorting 
+  probs <- cbind.data.frame(p, p.tilde, odds, odds.tilde, p.tilde.log)
+  probs <- probs[order(probs$p.tilde),]
+  
+  ## For MLE Later -- Calculate the z_i's ahead of time
+  win_var <- rbinom(length(probs$p.tilde), 1, probs$p)
+  win_index <- which(win_var == 1)
+  lose_index <- which(win_var == 0)
+  
+  ## Generate basis function / omega matrix from log(p.tilde)
+  # Get Knot Locations
+  num_quantiles <- 50
+  divisions <- seq(0, 1, by=1/num_quantiles)
+  quantiles <- quantile(probs$p.tilde, probs = divisions)
+  quantiles <- unique(sort(quantiles))
+  quantiles[1] <- quantiles[1] + 0.001
+  quantiles[length(quantiles)] <- quantiles[length(quantiles)] - 0.001
+  knot.range <- range(probs$p.tilde)
+  
+  # Generate the basis matrix and its correspoding 1st and 2nd deriv's
+  basis_0 <- myns(probs$p.tilde, knots = quantiles, intercept = TRUE)
+  basis_1 <- myns(probs$p.tilde, knots = quantiles, deriv = 1, intercept = TRUE)
+  basis_2 <- myns(probs$p.tilde, knots = quantiles, deriv = 2, intercept = TRUE)
+  
+  # We also want to calculate Omega on a fine grid of points
+  fine_grid <- seq(min(probs$p.tilde), max(probs$p.tilde), by=0.001)
+  basis_fine_grid <- myns(fine_grid, knots = quantiles, intercept = TRUE)
+  basis_fine_grid_d2 <- myns(fine_grid, knots = quantiles, deriv = 2, intercept = TRUE)
+  omega <- (1/nrow(basis_fine_grid)) * (t(basis_fine_grid_d2) %*% basis_fine_grid_d2)
+  
+  ## Grid for the optimization algorithm
+  pt <- seq(trunc, 0.5, by = 0.001)
+  basis_0.temp <- myns(pt, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_1.temp <- myns(pt, knots = quantiles, deriv = 1, intercept = TRUE, Boundary.knots = knot.range)
+  basis_sum.temp <- t(basis_0.temp)%*%basis_0.temp
+  
+  #### Adjustment 1: Risk function for lambda and grid for gamma. True p ####
+  ## CV SET UP to get min value of lambda from risk function
+  # Randomize the rows
+  rows <- 1:nrow(basis_0)
+  rows_rand <- rows[sample(rows)]
+  
+  # # Declate the number of groups that we want
+  n.group <- 10
+  # # Return a list with 10 approx equal vectors of rows. 
+  partitions <- split(rows_rand,
+                      cut(rows_rand,quantile(rows_rand,(0:n.group)/n.group),
+                          include.lowest=TRUE, labels=FALSE))
+  
+  ### Here we are going to pick the best value of lambda through cross validation
+  risk_cvsplit <- lapply(1:n.group, function(i) {
+    test.rows <- partitions[[i]]
+    train.rows <- assign_train(i)
+    b_g <- basis_0[train.rows,]
+    b_g_d1 <- basis_1[train.rows,]
+    b_g_d2 <- basis_2[train.rows,]
+    
+    # I can do the below without thinking about lambda because it doesn't depend on it (only on test and train).
+    # Calculate every term in the sum
+    basis_sum <- t(b_g)%*%b_g
+    
+    # calculate the column wise sum of our the first derivative of our basis matrix
+    sum_b_d1 <- t(b_g_d1)%*%rep(1,nrow(b_g_d1))
+    
+    # Now, we need to do this inversion for every value of lambda
+    eta_g <- matrix(nrow = ncol(b_g), ncol = length(lambda_grid))
+    for (i in 1:length(lambda_grid)) {
+      l <- lambda_grid[i]
+      eta_g[,i] <- -solve(basis_sum + (nrow(b_g)*l) * omega, tol = 1e-100) %*% sum_b_d1
+    }
+    
+    # Now, let's consider the test data
+    b_g_test <- basis_0[test.rows,]
+    b_g_d1_test <- basis_1[test.rows,]
+    
+    # We just need to calculate the basis sum part again.
+    basis_sum <- t(b_g_test)%*%b_g_test
+    
+    # Now, we can calculate the risk where eta was calculatd on our test data and we take the
+    # basis matrix to calculate the score function from our test data
+    one_vector <- as.vector(t(rep(1, nrow(b_g_test))))
+    
+    # Returns a vector of the risk for every value of lambda for a single test and train dataset
+    risk_hat <- apply(eta_g, 2, function(eta) {
+      return((1/nrow(b_g_test)) * t(eta) %*% basis_sum %*% eta
+             + (2/nrow(b_g_test)) * one_vector%*%b_g_d1_test%*%eta)
+    })
+    # We now want to loop over this for all permutations of our cross validation
+    return(risk_hat)
+  })
+  
+  r_cv_split_matrix <- do.call(cbind, risk_cvsplit)
+  r_cv_split_vec <- apply(r_cv_split_matrix, 1, mean)
+  names(r_cv_split_vec) <- lambda_grid
+  
+  # Get the value of lambda that corresponds to the smallest risk
+  lambda_min <- as.numeric(names(r_cv_split_vec[which(r_cv_split_vec 
+                                                      == min(r_cv_split_vec))[1]]))
+  lambda_storage.odds.b[c(1,2),q] <- lambda_min 
+  lambda_storage.p.b[c(1,2),q] <- lambda_min 
+
+  # Get an estimate of the score function with lambda_min
+  basis_sum <- t(basis_0)%*%basis_0
+  sum_b_d1 <- t(basis_1)%*%rep(1,nrow(basis_1))
+  eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda_storage.odds.b[1,q]) * omega, tol = 1e-100) %*% sum_b_d1
+  score_hat_risk <- basis_0%*%eta_hat
+  score_hat_risk_d1 <- basis_1%*%eta_hat
+  
+  ## Optimal Gamma from Risk True p
+  optimal_gamma_check.true <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.odds.b[1,q], g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = TRUE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.true == min(optimal_gamma_check.true))]
+  gamma_storage.odds.b[1,q] <- gamma_min
+  
+  optimal_gamma_check.true <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.p.b[1,q], g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = FALSE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.true == min(optimal_gamma_check.true))]
+  gamma_storage.p.b[1,q] <- gamma_min
+  
+  ## Optimal Gamma from Risk Est p
+  optimal_gamma_check.est <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.odds.b[1,q], g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = TRUE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.est == max(optimal_gamma_check.est))]
+  gamma_storage.odds.b[2,q] <- gamma_min
+  
+  optimal_gamma_check.est <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.p.b[1,q], g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.est == max(optimal_gamma_check.est))]
+  gamma_storage.p.b[2,q] <- gamma_min
+  
+  #### Adjustment 2 & 4: Grid search for both lambda and gamma. True and est p ####
+  q.grid <- lapply(lambda_grid, function(l) {
+    ## True p
+    gamma.true <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = TRUE)
+    })
+    names(gamma.true) <- gamma_grid  
+    
+    ## MLE 
+    gamma.est <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.est) <- gamma_grid
+    
+    return(cbind(gamma.true, gamma.est))
+  })
+  
+  g.true.list <- lapply(q.grid, function(i) i[,1])
+  g.est.list <- lapply(q.grid, function(i) i[,2])
+  q.grid.true <- do.call(cbind, g.true.list)
+  q.grid.est <- do.call(cbind, g.est.list)
+  
+  index.true.min <- which(q.grid.true == min(q.grid.true), arr.ind = TRUE)
+  index.est.max <- which(q.grid.est == max(q.grid.est), arr.ind = TRUE)
+  
+  ## Get estimated value of gamma and lambda
+  gamma_min <- gamma_grid[index.true.min[1]] 
+  lambda_min <- lambda_grid[index.true.min[2]]
+  lambda_storage.odds.b[3,q] <- lambda_min
+  gamma_storage.odds.b[3,q] <- gamma_min
+  
+  gamma_min <- gamma_grid[index.est.max[1]] 
+  lambda_min <- lambda_grid[index.est.max[2]]
+  lambda_storage.odds.b[4,q] <- lambda_min
+  gamma_storage.odds.b[4,q] <- gamma_min
+  
+  ########
+  
+  q.grid <- lapply(lambda_grid, function(l) {
+    ## True p
+    gamma.true <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.true) <- gamma_grid  
+    
+    ## MLE 
+    gamma.est <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.est) <- gamma_grid
+    
+    return(cbind(gamma.true, gamma.est))
+  })
+  
+  g.true.list <- lapply(q.grid, function(i) i[,1])
+  g.est.list <- lapply(q.grid, function(i) i[,2])
+  q.grid.true <- do.call(cbind, g.true.list)
+  q.grid.est <- do.call(cbind, g.est.list)
+  
+  index.true.min <- which(q.grid.true == min(q.grid.true), arr.ind = TRUE)
+  index.est.max <- which(q.grid.est == max(q.grid.est), arr.ind = TRUE)
+  
+  ## Get estimated value of gamma and lambda
+  gamma_min <- gamma_grid[index.true.min[1]] 
+  lambda_min <- lambda_grid[index.true.min[2]]
+  lambda_storage.p.b[3,q] <- lambda_min
+  gamma_storage.p.b[3,q] <- gamma_min
+  
+  gamma_min <- gamma_grid[index.est.max[1]] 
+  lambda_min <- lambda_grid[index.est.max[2]]
+  lambda_storage.p.b[4,q] <- lambda_min
+  gamma_storage.p.b[4,q] <- gamma_min
+  
+  #### James Stein ####
+  
+  ## JS 1 - True p
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    js.ratio <- probs.js / (1-probs.js)
+    terms <- ((probs$odds / js.ratio) - 1)^2
+    return(sum(terms))
+  })
+  min_element <- which(gridsearch.js == min(gridsearch.js, na.rm = TRUE))
+  sigma_min.true <- const_grid[min_element]
+  sigma_storage.odds.b[1,q] <- sigma_min.true
+  
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    terms <- ((probs$p / probs.js) - 1)^2
+    return(sum(terms))
+  })
+  min_element <- which(gridsearch.js == min(gridsearch.js, na.rm = TRUE))
+  sigma_min.true <- const_grid[min_element]
+  sigma_storage.p.b[1,q] <- sigma_min.true
+  
+  ## JS 2 - MLE
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    bin.log <- close.true.binomial(probs.js)
+    return(bin.log)
+  })
+  max_element <- which(gridsearch.js == max(gridsearch.js, na.rm = TRUE))
+  sigma_min.mle <- const_grid[max_element]
+  sigma_storage.odds.b[2,q] <- sigma_min.mle
+  sigma_storage.p.b[2,q] <- sigma_min.mle
+  
+  ## Store training probabilities
+  data.train[[q]] <- probs
+  
+  #############################################################
+  #### Generate new probabilities to test these parameters ####
+  #############################################################
+  
+  p <- runif(n.prob2, 0, 0.5)
+  p.tilde <- p.tilde.gen(p, n.prob2)
+  
+  # adjust for overly extreme probs
+  p.tilde[p.tilde < trunc] <- trunc
+  
+  # Create the true and error odds
+  odds <- p / (1-p)
+  odds.tilde <- p.tilde / (1-p.tilde)
+  
+  # Sufficient statistic
+  p.tilde.log <- log(p.tilde)
+  
+  # Store everything in a dataframe for sorting
+  probs <- cbind.data.frame(p, p.tilde, odds, odds.tilde, p.tilde.log)
+  probs <- probs[order(probs$p.tilde),]
+  
+  # Generate the basis matrix and its correspoding 1st and 2nd deriv's
+  basis_0 <- myns(probs$p.tilde, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_1 <- myns(probs$p.tilde, knots = quantiles, deriv = 1, intercept = TRUE, Boundary.knots = knot.range)
+  basis_2 <- myns(probs$p.tilde, knots = quantiles, deriv = 2, intercept = TRUE, Boundary.knots = knot.range)
+  
+  # We also want to calculate Omega on a fine grid of points
+  fine_grid <- seq(min(probs$p.tilde), max(probs$p.tilde), by=0.001)
+  basis_fine_grid <- myns(fine_grid, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_fine_grid_d2 <- myns(fine_grid, knots = quantiles, deriv = 2, intercept = TRUE, Boundary.knots = knot.range)
+  omega <- (1/nrow(basis_fine_grid)) * (t(basis_fine_grid_d2) %*% basis_fine_grid_d2)
+  basis_sum <- t(basis_0)%*%basis_0
+  sum_b_d1 <- t(basis_1)%*%rep(1,nrow(basis_1))
+  
+  #### Create our adjusted probability estimates
+  ## (1) Risk Lambda - Grid Gamma True p
+  probs$odds.hat.s1.odds <- tweedie.odds.est(lambda_storage.odds.b[1,q], gamma_storage.odds.b[1,q], quad.prog = TRUE)
+  probs$odds.hat.s1.p <- tweedie.odds.est(lambda_storage.p.b[1,q], gamma_storage.p.b[1,q], quad.prog = TRUE)
+
+  ## (2) Risk Lambda - Grid Gamma MLE
+  probs$odds.hat.s2.odds <- tweedie.odds.est(lambda_storage.odds.b[2,q], gamma_storage.odds.b[2,q], quad.prog = TRUE)
+  probs$odds.hat.s2.p <- tweedie.odds.est(lambda_storage.p.b[2,q], gamma_storage.p.b[2,q], quad.prog = TRUE)
+
+  ## (3) Grid Lambda and Gamma TRUE
+  probs$odds.hat.s3.odds <- tweedie.odds.est(lambda_storage.odds.b[3,q], gamma_storage.odds.b[3,q], quad.prog = TRUE)
+  probs$odds.hat.s3.p <- tweedie.odds.est(lambda_storage.p.b[3,q], gamma_storage.p.b[3,q], quad.prog = TRUE)
+  
+  ## (4) Grid Lambda and Gamma TRUE
+  probs$odds.hat.s4.odds <- tweedie.odds.est(lambda_storage.odds.b[4,q], gamma_storage.odds.b[4,q], quad.prog = TRUE)
+  probs$odds.hat.s4.p <- tweedie.odds.est(lambda_storage.p.b[4,q], gamma_storage.p.b[4,q], quad.prog = TRUE)
+  
+  ## (5) JS Odds
+  probs$prob.js.true.sigma_o <- JS_sigma(probs$p.tilde, sigma_storage.odds.b[1,q])
+  probs$odds.js.true.sigma_o <- probs$prob.js.true.sigma_o / (1-probs$prob.js.true.sigma_o)
+  probs$prob.js.mle.sigma_o <- JS_sigma(probs$p.tilde, sigma_storage.odds.b[2,q])
+  probs$odds.js.mle.sigma_o <- probs$prob.js.mle.sigma_o / (1-probs$prob.js.mle.sigma_o)
+
+  ## (6) JS P
+  probs$prob.js.true.sigma_p <- JS_sigma(probs$p.tilde, sigma_storage.p.b[1,q])
+  probs$odds.js.true.sigma_p <- probs$prob.js.true.sigma_p / (1-probs$prob.js.true.sigma_p)
+  probs$prob.js.mle.sigma_p <- JS_sigma(probs$p.tilde, sigma_storage.p.b[2,q])
+  probs$odds.js.mle.sigma_p <- probs$prob.js.mle.sigma_p / (1-probs$prob.js.mle.sigma_p)
+  
+  ## Empty containers for the oracle to remember to do this later
+  probs$oracle.tweedie <- rep(NA, n.prob2)
+  probs$oracle.odds.hat <- rep(NA, n.prob2)
+  probs$oracle.p.hat <- rep(NA, n.prob2)
+  
+  ## Get Error for all of our estimates against true odds
+  err.naive.odds[q] <- close.true(probs$odds, probs$odds.tilde)
+  err.tweedie.1.odds[q] <- close.true(probs$odds, probs$odds.hat.s1.odds)
+  err.tweedie.2.odds[q] <- close.true(probs$odds, probs$odds.hat.s2.odds)
+  err.tweedie.3.odds[q] <- close.true(probs$odds, probs$odds.hat.s3.odds)
+  err.tweedie.4.odds[q] <- close.true(probs$odds, probs$odds.hat.s4.odds)
+  err.js.ptrue.odds[q] <- close.true(probs$odds, probs$odds.js.true.sigma_o)
+  err.js.mle.odds[q] <- close.true(probs$odds, probs$odds.js.mle.sigma_o)
+  err.oracle.odds[q] <- close.true(probs$odds, probs$oracle.odds.hat)
+  
+  ## Get Error for all of our estimates against true p
+  err.naive.p[q] <- close.true(probs$p, probs$p.tilde)
+  err.tweedie.1.p[q] <- close.true(probs$p, probs$odds.hat.s1.p / (1+probs$odds.hat.s1.p))
+  err.tweedie.2.p[q] <- close.true(probs$p, probs$odds.hat.s2.p / (1+probs$odds.hat.s2.p))
+  err.tweedie.3.p[q] <- close.true(probs$p, probs$odds.hat.s3.p / (1+probs$odds.hat.s3.p))
+  err.tweedie.4.p[q] <- close.true(probs$p, probs$odds.hat.s4.p / (1+probs$odds.hat.s4.p))
+  err.js.ptrue.p[q] <- close.true(probs$p, probs$prob.js.true.sigma_p)
+  err.js.mle.p[q] <- close.true(probs$p, probs$prob.js.mle.sigma_p)
+  err.oracle.p[q] <- close.true(probs$p, probs$oracle.odds.hat)
+  
+  ## Store test probabilities
+  data.test[[q]] <- probs
+  
+  ## Store EC Terms
+  ec.odds.b[[q]] <- cbind(close.true.terms(probs$odds, probs$odds.tilde),
+                   close.true.terms(probs$odds, probs$odds.hat.s1.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s2.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s3.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s4.odds),
+                   close.true.terms(probs$odds, probs$odds.js.mle.sigma_o))
+  
+  ec.p.b[[q]] <- cbind(close.true.terms(probs$p, probs$p.tilde),
+                   close.true.terms(probs$p, probs$odds.hat.s1.p / (1+probs$odds.hat.s1.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s2.p / (1+probs$odds.hat.s2.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s3.p / (1+probs$odds.hat.s3.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s4.p / (1+probs$odds.hat.s4.p)),
+                   close.true.terms(probs$p, probs$prob.js.mle.sigma_p))
+  
+  ## Erase later
+  print(q)
+}
+
+## Generate a summary matrix
+mean.err.matrix <- as.data.frame(matrix(nrow = 8, ncol = 6))
+colnames(mean.err.matrix) <- c("Odds.hat Mean", "Odds.hat SD Mean", "Median of Odds.hat Means", "P.hat Mean", "P.hat SD Mean", "Median of P.hat Means")
+rownames(mean.err.matrix) <- c("Naive", "Tweedie - Risk & true p", "Tweedie - Risk & MLE",
+                               "Tweedie - Grid & True p", "Tweedie - Grid & MLE", 
+                               "JS - True p", "JS - MLE",
+                               "Oracle")
+mean.err.matrix[1,] <- c(mean(err.naive.odds), sqrt((var(err.naive.odds)) / nits), median(err.naive.odds),
+                         mean(err.naive.p), sqrt((var(err.naive.p)) / nits), median(err.naive.p)) 
+mean.err.matrix[2,] <- c(mean(err.tweedie.1.odds), sqrt((var(err.tweedie.1.odds)) / nits), median(err.tweedie.1.odds),
+                         mean(err.tweedie.1.p), sqrt((var(err.tweedie.1.p)) / nits), median(err.tweedie.1.p)) 
+mean.err.matrix[3,] <- c(mean(err.tweedie.2.odds), sqrt((var(err.tweedie.2.odds)) / nits), median(err.tweedie.2.odds),
+                         mean(err.tweedie.2.p), sqrt((var(err.tweedie.2.p)) / nits), median(err.tweedie.2.p)) 
+mean.err.matrix[4,] <- c(mean(err.tweedie.3.odds), sqrt((var(err.tweedie.3.odds)) / nits), median(err.tweedie.3.odds),
+                         mean(err.tweedie.3.p), sqrt((var(err.tweedie.3.p)) / nits), median(err.tweedie.3.p)) 
+mean.err.matrix[5,] <- c(mean(err.tweedie.4.odds), sqrt((var(err.tweedie.4.odds)) / nits), median(err.tweedie.4.odds),
+                         mean(err.tweedie.4.p), sqrt((var(err.tweedie.4.p)) / nits), median(err.tweedie.4.p)) 
+mean.err.matrix[6,] <- c(mean(err.js.ptrue.odds), sqrt((var(err.js.ptrue.odds)) / nits), median(err.js.ptrue.odds),
+                         mean(err.js.ptrue.p), sqrt((var(err.js.ptrue.p)) / nits), median(err.js.ptrue.p)) 
+mean.err.matrix[7,] <- c(mean(err.js.mle.odds), sqrt((var(err.js.mle.odds)) / nits), median(err.js.mle.odds),
+                         mean(err.js.mle.p), sqrt((var(err.js.mle.p)) / nits), median(err.js.mle.p)) 
+mean.err.matrix[8,] <- c(mean(err.oracle.odds), sqrt((var(err.oracle.odds)) / nits), median(err.oracle.odds),
+                         mean(err.oracle.odds), sqrt((var(err.oracle.odds)) / nits), median(err.oracle.odds)) 
+
+err.matrix.ptilde <- kable(mean.err.matrix, caption = "Unif(0, 0.5) prior")
+print(err.matrix.ptilde)
+```
+
+```{r functions specific for simulation 3}
+## QuadProg Quadratic Programming FCN
+eta_min_fcn <- function(lambda, gamma) {
+  ## Define vars used below
+  n <- nrow(basis_1.temp)
+  one <- rep(1, length = n)
+  
+  ## Set up into the correct form
+  Dmat <- 2*((1/n) * basis_sum.temp + lambda*omega)
+  dvec <- t(-(2/n) * t(t(basis_1.temp)%*%one))
+  
+  ## We need to add the constraints
+  x <- pt
+  rows.min <- which(pt == trunc)
+  x.min <- x[rows.min] 
+  
+  b.vec1 <- ((trunc - x.min/(1-x.min))*(1/gamma) + (x.min/(1-x.min))-1)*(1/x.min)
+  b.vec2 <- (1/(1-x)^2)*(1-(1/gamma))
+  
+  Amat.part1 <- basis_0.temp[rows.min,]
+  Amat.part2 <- (basis_0.temp + x*basis_1.temp)
+  Amat.temp <- rbind(Amat.part1, Amat.part2)
+  Amat <- t(Amat.temp)
+  bvec <- c(b.vec1, b.vec2)
+  
+  return(solve.QP(Dmat, dvec, Amat, bvec, meq=0)$solution)
+}
+
+## Function to make the loops easier to understand
+tweed.adj.fcn <- function(lambda, gamma, probs.df, mle = FALSE, quad.prog = FALSE, EC.Odds = TRUE) {
+  if (quad.prog == FALSE) {
+    eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda) * omega, tol = 1e-100) %*% sum_b_d1
+  }
+  else {
+    eta_hat <- eta_min_fcn(lambda, gamma)
+  }
+  score_hat <- basis_0%*%eta_hat
+  score_hat_d1 <- basis_1%*%eta_hat
+  score_hat_d2 <- basis_2%*%eta_hat
+
+  p.tweedie.ratio <- probs$odds.tilde + gamma * (probs$p.tilde*score_hat+1 - probs$odds.tilde)
+  
+  p.tweedie.ratio.2 <- gamma^2*(score_hat_d2+(1/gamma-1)/(1-probs$p.tilde)*probs$odds.tilde) +
+    (probs$odds.tilde+gamma*(score_hat_d1-probs$odds.tilde))^2
+  
+  odds.hat.var <- gamma^2 * (probs$p.tilde^2*score_hat_d1 + probs$p.tilde*score_hat
+                             + (1/gamma - 1)*(probs$p.tilde / (1-probs$p.tilde)^2))
+  
+  p.hat <- (p.tweedie.ratio^2*(1+p.tweedie.ratio)+((1-2*p.tweedie.ratio)/(1+p.tweedie.ratio))*odds.hat.var) / 
+    (p.tweedie.ratio*(1+p.tweedie.ratio)^2-odds.hat.var)
+  odds.hat <- p.hat / (1-p.hat)
+  
+  if (mle == FALSE) {
+    ifelse(EC.Odds, Q.gamma <- close.true(probs.df$odds, odds.hat), 
+           Q.gamma <- close.true(probs.df$p, p.hat))
+  }
+  else {
+    est <- odds.hat / (1+odds.hat)
+    Q.gamma <- close.true.binomial(est)
+  }
+  return(Q.gamma)
+}
+
+## Function to produce tweedie odds estimates from a given lambda and gamma
+tweedie.odds.est <- function(lambda, gamma, quad.prog = FALSE) {
+  if (quad.prog == FALSE) {
+    eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda) * omega, tol = 1e-100) %*% sum_b_d1
+  }
+  else {
+    eta_hat <- eta_min_fcn(lambda, gamma)
+  }
+  
+  score_hat <- basis_0%*%eta_hat
+  score_hat_d1 <- basis_1%*%eta_hat
+  score_hat_d2 <- basis_2%*%eta_hat
+  
+  p.tweedie.ratio <- probs$odds.tilde + gamma * (probs$p.tilde*score_hat+1 - probs$odds.tilde)
+  
+  p.tweedie.ratio.2 <- gamma^2*(score_hat_d2+(1/gamma-1)/(1-probs$p.tilde)*probs$odds.tilde) +
+    (probs$odds.tilde+gamma*(score_hat_d1-probs$odds.tilde))^2
+  
+  odds.hat.var <- gamma^2 * (probs$p.tilde^2*score_hat_d1 + probs$p.tilde*score_hat
+                             + (1/gamma - 1)*(probs$p.tilde / (1-probs$p.tilde)^2))
+  
+  p.hat <- (p.tweedie.ratio^2*(1+p.tweedie.ratio)+((1-2*p.tweedie.ratio)/(1+p.tweedie.ratio))*odds.hat.var) / 
+    (p.tweedie.ratio*(1+p.tweedie.ratio)^2-odds.hat.var)
+  odds.hat <- p.hat / (1-p.hat)
+  
+  return(odds.hat)
+}
+```
+
+```{r simulation 3 - v(tilde{p}) - taylor}
+## Containers to store observations
+lambda_storage.odds.c <- matrix(NA, ncol=nits, nrow=4)
+rownames(lambda_storage.odds.c) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+gamma_storage.odds.c <- matrix(NA, ncol=nits, nrow=4)
+rownames(gamma_storage.odds.c) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+sigma_storage.odds.c <- matrix(NA, ncol=nits, nrow=2)
+rownames(sigma_storage.odds.c) <- c("true", "est")
+
+lambda_storage.p.c <- matrix(NA, ncol=nits, nrow=4)
+rownames(lambda_storage.p.c) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+gamma_storage.p.c <- matrix(NA, ncol=nits, nrow=4)
+rownames(gamma_storage.p.c) <- c("Risk & True Grid", "Risk & MLE Grid", "True Grid", "MLE Grid")
+
+sigma_storage.p.c <- matrix(NA, ncol=nits, nrow=2)
+rownames(sigma_storage.p.c) <- c("true", "est")
+
+## Containers for errors using EC of odds.hat
+err.naive.odds <- vector(mode="numeric", length=nits)
+err.tweedie.1.odds <- vector(mode="numeric", length=nits)
+err.tweedie.2.odds <- vector(mode="numeric", length=nits)
+err.tweedie.3.odds <- vector(mode="numeric", length=nits)
+err.tweedie.4.odds <- vector(mode="numeric", length=nits)
+err.js.ptrue.odds <- vector(mode="numeric", length=nits)
+err.js.mle.odds <- vector(mode="numeric", length=nits)
+err.oracle.odds <- vector(mode="numeric", length=nits)
+
+## Containers for errors using EC of p.hat
+err.naive.p <- vector(mode="numeric", length=nits)
+err.tweedie.1.p <- vector(mode="numeric", length=nits)
+err.tweedie.2.p <- vector(mode="numeric", length=nits)
+err.tweedie.3.p <- vector(mode="numeric", length=nits)
+err.tweedie.4.p <- vector(mode="numeric", length=nits)
+err.js.ptrue.p <- vector(mode="numeric", length=nits)
+err.js.mle.p <- vector(mode="numeric", length=nits)
+err.oracle.p <- vector(mode="numeric", length=nits)
+
+## Containers to store data used
+data.train <- list()
+data.test <- list()
+
+## EC Terms Storage
+ec.odds.c <- list()
+ec.p.c <- list()
+
+set.seed(091118)
+for (q in 1:nits) {
+  ## Generate the probability matrix
+  p <- runif(n.prob1, 0, 0.5)
+  p.tilde <- p.tilde.gen(p, n.prob1)
+  
+  # adjust for overly extreme probs
+  p.tilde[p.tilde < trunc] <- trunc
+  
+  # Create the true and error odds
+  odds <- p / (1-p)
+  odds.tilde <- p.tilde / (1-p.tilde)
+  
+  # Sufficient statistic 
+  p.tilde.log <- log(p.tilde)
+  
+  # Store everything in a dataframe for sorting 
+  probs <- cbind.data.frame(p, p.tilde, odds, odds.tilde, p.tilde.log)
+  probs <- probs[order(probs$p.tilde),]
+    
+  ## For MLE Later -- Calculate the z_i's ahead of time
+  win_var <- rbinom(length(probs$p.tilde), 1, probs$p)
+  win_index <- which(win_var == 1)
+  lose_index <- which(win_var == 0)
+  
+  ## Generate basis function / omega matrix from log(p.tilde)
+  # Get Knot Locations
+  num_quantiles <- 50
+  divisions <- seq(0, 1, by=1/num_quantiles)
+  quantiles <- quantile(probs$p.tilde, probs = divisions)
+  quantiles <- unique(sort(quantiles))
+  quantiles[1] <- quantiles[1] + 0.001
+  quantiles[length(quantiles)] <- quantiles[length(quantiles)] - 0.001
+  knot.range <- range(probs$p.tilde)
+  
+  # Generate the basis matrix and its correspoding 1st and 2nd deriv's
+  basis_0 <- myns(probs$p.tilde, knots = quantiles, intercept = TRUE)
+  basis_1 <- myns(probs$p.tilde, knots = quantiles, deriv = 1, intercept = TRUE)
+  basis_2 <- myns(probs$p.tilde, knots = quantiles, deriv = 2, intercept = TRUE)
+  
+  # We also want to calculate Omega on a fine grid of points
+  fine_grid <- seq(min(probs$p.tilde), max(probs$p.tilde), by=0.001)
+  basis_fine_grid <- myns(fine_grid, knots = quantiles, intercept = TRUE)
+  basis_fine_grid_d2 <- myns(fine_grid, knots = quantiles, deriv = 2, intercept = TRUE)
+  omega <- (1/nrow(basis_fine_grid)) * (t(basis_fine_grid_d2) %*% basis_fine_grid_d2)
+  
+  ## Grid for the optimization algorithm
+  pt <- seq(trunc, 0.5, by = 0.001)
+  basis_0.temp <- myns(pt, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_1.temp <- myns(pt, knots = quantiles, deriv = 1, intercept = TRUE, Boundary.knots = knot.range)
+  basis_sum.temp <- t(basis_0.temp)%*%basis_0.temp
+  
+  #### Adjustment 1: Risk function for lambda and grid for gamma. True p ####
+  ## CV SET UP to get min value of lambda from risk function
+  # Randomize the rows
+  rows <- 1:nrow(basis_0)
+  rows_rand <- rows[sample(rows)]
+  
+  # # Declate the number of groups that we want
+  n.group <- 10
+  # # Return a list with 10 approx equal vectors of rows. 
+  partitions <- split(rows_rand,
+                      cut(rows_rand,quantile(rows_rand,(0:n.group)/n.group),
+                          include.lowest=TRUE, labels=FALSE))
+  
+  ### Here we are going to pick the best value of lambda through cross validation
+  risk_cvsplit <- lapply(1:n.group, function(i) {
+    test.rows <- partitions[[i]]
+    train.rows <- assign_train(i)
+    b_g <- basis_0[train.rows,]
+    b_g_d1 <- basis_1[train.rows,]
+    b_g_d2 <- basis_2[train.rows,]
+    
+    # I can do the below without thinking about lambda because it doesn't depend on it (only on test and train).
+    # Calculate every term in the sum
+    basis_sum <- t(b_g)%*%b_g
+    
+    # calculate the column wise sum of our the first derivative of our basis matrix
+    sum_b_d1 <- t(b_g_d1)%*%rep(1,nrow(b_g_d1))
+    
+    # Now, we need to do this inversion for every value of lambda
+    eta_g <- matrix(nrow = ncol(b_g), ncol = length(lambda_grid))
+    for (i in 1:length(lambda_grid)) {
+      l <- lambda_grid[i]
+      eta_g[,i] <- -solve(basis_sum + (nrow(b_g)*l) * omega, tol = 1e-100) %*% sum_b_d1
+    }
+    
+    # Now, let's consider the test data
+    b_g_test <- basis_0[test.rows,]
+    b_g_d1_test <- basis_1[test.rows,]
+    
+    # We just need to calculate the basis sum part again.
+    basis_sum <- t(b_g_test)%*%b_g_test
+    
+    # Now, we can calculate the risk where eta was calculatd on our test data and we take the
+    # basis matrix to calculate the score function from our test data
+    one_vector <- as.vector(t(rep(1, nrow(b_g_test))))
+    
+    # Returns a vector of the risk for every value of lambda for a single test and train dataset
+    risk_hat <- apply(eta_g, 2, function(eta) {
+      return((1/nrow(b_g_test)) * t(eta) %*% basis_sum %*% eta
+             + (2/nrow(b_g_test)) * one_vector%*%b_g_d1_test%*%eta)
+    })
+    # We now want to loop over this for all permutations of our cross validation
+    return(risk_hat)
+  })
+  
+  r_cv_split_matrix <- do.call(cbind, risk_cvsplit)
+  r_cv_split_vec <- apply(r_cv_split_matrix, 1, mean)
+  names(r_cv_split_vec) <- lambda_grid
+  
+  # Get the value of lambda that corresponds to the smallest risk
+  lambda_min <- as.numeric(names(r_cv_split_vec[which(r_cv_split_vec 
+                                                      == min(r_cv_split_vec))[1]]))
+  lambda_storage.odds.c[c(1,2),q] <- lambda_min 
+  lambda_storage.p.c[c(1,2),q] <- lambda_min 
+
+  # Get an estimate of the score function with lambda_min
+  basis_sum <- t(basis_0)%*%basis_0
+  sum_b_d1 <- t(basis_1)%*%rep(1,nrow(basis_1))
+  eta_hat <- -solve(basis_sum + (nrow(basis_0)*lambda_storage.odds.c[1,q]) * omega, tol = 1e-100) %*% sum_b_d1
+  score_hat_risk <- basis_0%*%eta_hat
+  score_hat_risk_d1 <- basis_1%*%eta_hat
+  
+  ## Optimal Gamma from Risk True p
+  optimal_gamma_check.true <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.odds.c[1,q], g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = TRUE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.true == min(optimal_gamma_check.true))]
+  gamma_storage.odds.c[1,q] <- gamma_min
+  
+  optimal_gamma_check.true <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.p.c[1,q], g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = FALSE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.true == min(optimal_gamma_check.true))]
+  gamma_storage.p.c[1,q] <- gamma_min
+  
+  ## Optimal Gamma from Risk Est p
+  optimal_gamma_check.est <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.odds.c[1,q], g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = TRUE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.est == max(optimal_gamma_check.est))]
+  gamma_storage.odds.c[2,q] <- gamma_min
+  
+  optimal_gamma_check.est <- sapply(gamma_grid, function(g) {
+    tweed.adj.fcn(lambda_storage.p.c[1,q], g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+  })
+  gamma_min <- gamma_grid[which(optimal_gamma_check.est == max(optimal_gamma_check.est))]
+  gamma_storage.p.c[2,q] <- gamma_min
+  
+  #### Adjustment 2 & 4: Grid search for both lambda and gamma. True and est p ####
+  q.grid <- lapply(lambda_grid, function(l) {
+    ## True p
+    gamma.true <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = TRUE)
+    })
+    names(gamma.true) <- gamma_grid  
+    
+    ## MLE 
+    gamma.est <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.est) <- gamma_grid
+    
+    return(cbind(gamma.true, gamma.est))
+  })
+  
+  g.true.list <- lapply(q.grid, function(i) i[,1])
+  g.est.list <- lapply(q.grid, function(i) i[,2])
+  q.grid.true <- do.call(cbind, g.true.list)
+  q.grid.est <- do.call(cbind, g.est.list)
+  
+  index.true.min <- which(q.grid.true == min(q.grid.true), arr.ind = TRUE)
+  index.est.max <- which(q.grid.est == max(q.grid.est), arr.ind = TRUE)
+  
+  ## Get estimated value of gamma and lambda
+  gamma_min <- gamma_grid[index.true.min[1]] 
+  lambda_min <- lambda_grid[index.true.min[2]]
+  lambda_storage.odds.c[3,q] <- lambda_min
+  gamma_storage.odds.c[3,q] <- gamma_min
+  
+  gamma_min <- gamma_grid[index.est.max[1]] 
+  lambda_min <- lambda_grid[index.est.max[2]]
+  lambda_storage.odds.c[4,q] <- lambda_min
+  gamma_storage.odds.c[4,q] <- gamma_min
+  
+  ########
+  
+  q.grid <- lapply(lambda_grid, function(l) {
+    ## True p
+    gamma.true <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = FALSE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.true) <- gamma_grid  
+    
+    ## MLE 
+    gamma.est <- sapply(gamma_grid, function(g) {
+      tweed.adj.fcn(l, g, probs, mle = TRUE, quad.prog = TRUE, EC.Odds = FALSE)
+    })
+    names(gamma.est) <- gamma_grid
+    
+    return(cbind(gamma.true, gamma.est))
+  })
+  
+  g.true.list <- lapply(q.grid, function(i) i[,1])
+  g.est.list <- lapply(q.grid, function(i) i[,2])
+  q.grid.true <- do.call(cbind, g.true.list)
+  q.grid.est <- do.call(cbind, g.est.list)
+  
+  index.true.min <- which(q.grid.true == min(q.grid.true), arr.ind = TRUE)
+  index.est.max <- which(q.grid.est == max(q.grid.est), arr.ind = TRUE)
+  
+  ## Get estimated value of gamma and lambda
+  gamma_min <- gamma_grid[index.true.min[1]] 
+  lambda_min <- lambda_grid[index.true.min[2]]
+  lambda_storage.p.c[3,q] <- lambda_min
+  gamma_storage.p.c[3,q] <- gamma_min
+  
+  gamma_min <- gamma_grid[index.est.max[1]] 
+  lambda_min <- lambda_grid[index.est.max[2]]
+  lambda_storage.p.c[4,q] <- lambda_min
+  gamma_storage.p.c[4,q] <- gamma_min
+  
+  #### James Stein ####
+  
+  ## JS 1 - True p
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    js.ratio <- probs.js / (1-probs.js)
+    terms <- ((probs$odds / js.ratio) - 1)^2
+    return(sum(terms))
+  })
+  min_element <- which(gridsearch.js == min(gridsearch.js, na.rm = TRUE))
+  sigma_min.true <- const_grid[min_element]
+  sigma_storage.odds.c[1,q] <- sigma_min.true
+  
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    terms <- ((probs$p / probs.js) - 1)^2
+    return(sum(terms))
+  })
+  min_element <- which(gridsearch.js == min(gridsearch.js, na.rm = TRUE))
+  sigma_min.true <- const_grid[min_element]
+  sigma_storage.p.c[1,q] <- sigma_min.true
+  
+  ## JS 2 - MLE
+  gridsearch.js <- sapply(const_grid, function(c) {
+    probs.js <- JS_sigma(probs$p.tilde, c)
+    bin.log <- close.true.binomial(probs.js)
+    return(bin.log)
+  })
+  max_element <- which(gridsearch.js == max(gridsearch.js, na.rm = TRUE))
+  sigma_min.mle <- const_grid[max_element]
+  sigma_storage.odds.c[2,q] <- sigma_min.mle
+  sigma_storage.p.c[2,q] <- sigma_min.mle
+  
+  ## Store training probabilities
+  data.train[[q]] <- probs
+  
+  #############################################################
+  #### Generate new probabilities to test these parameters ####
+  #############################################################
+  
+  p <- runif(n.prob2, 0, 0.5)
+  p.tilde <- p.tilde.gen(p, n.prob2)
+  
+  # adjust for overly extreme probs
+  p.tilde[p.tilde < trunc] <- trunc
+  
+  # Create the true and error odds
+  odds <- p / (1-p)
+  odds.tilde <- p.tilde / (1-p.tilde)
+  
+  # Sufficient statistic
+  p.tilde.log <- log(p.tilde)
+  
+  # Store everything in a dataframe for sorting
+  probs <- cbind.data.frame(p, p.tilde, odds, odds.tilde, p.tilde.log)
+  probs <- probs[order(probs$p.tilde),]
+  
+  # Generate the basis matrix and its correspoding 1st and 2nd deriv's
+  basis_0 <- myns(probs$p.tilde, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_1 <- myns(probs$p.tilde, knots = quantiles, deriv = 1, intercept = TRUE, Boundary.knots = knot.range)
+  basis_2 <- myns(probs$p.tilde, knots = quantiles, deriv = 2, intercept = TRUE, Boundary.knots = knot.range)
+  
+  # We also want to calculate Omega on a fine grid of points
+  fine_grid <- seq(min(probs$p.tilde), max(probs$p.tilde), by=0.001)
+  basis_fine_grid <- myns(fine_grid, knots = quantiles, intercept = TRUE, Boundary.knots = knot.range)
+  basis_fine_grid_d2 <- myns(fine_grid, knots = quantiles, deriv = 2, intercept = TRUE, Boundary.knots = knot.range)
+  omega <- (1/nrow(basis_fine_grid)) * (t(basis_fine_grid_d2) %*% basis_fine_grid_d2)
+  basis_sum <- t(basis_0)%*%basis_0
+  sum_b_d1 <- t(basis_1)%*%rep(1,nrow(basis_1))
+  
+  #### Create our adjusted probability estimates
+  ## (1) Risk Lambda - Grid Gamma True p
+  probs$odds.hat.s1.odds <- tweedie.odds.est(lambda_storage.odds.c[1,q], gamma_storage.odds.c[1,q], quad.prog = TRUE)
+  probs$odds.hat.s1.p <- tweedie.odds.est(lambda_storage.p.c[1,q], gamma_storage.p.c[1,q], quad.prog = TRUE)
+
+  ## (2) Risk Lambda - Grid Gamma MLE
+  probs$odds.hat.s2.odds <- tweedie.odds.est(lambda_storage.odds.c[2,q], gamma_storage.odds.c[2,q], quad.prog = TRUE)
+  probs$odds.hat.s2.p <- tweedie.odds.est(lambda_storage.p.c[2,q], gamma_storage.p.c[2,q], quad.prog = TRUE)
+
+  ## (3) Grid Lambda and Gamma TRUE
+  probs$odds.hat.s3.odds <- tweedie.odds.est(lambda_storage.odds.c[3,q], gamma_storage.odds.c[3,q], quad.prog = TRUE)
+  probs$odds.hat.s3.p <- tweedie.odds.est(lambda_storage.p.c[3,q], gamma_storage.p.c[3,q], quad.prog = TRUE)
+  
+  ## (4) Grid Lambda and Gamma TRUE
+  probs$odds.hat.s4.odds <- tweedie.odds.est(lambda_storage.odds.c[4,q], gamma_storage.odds.c[4,q], quad.prog = TRUE)
+  probs$odds.hat.s4.p <- tweedie.odds.est(lambda_storage.p.c[4,q], gamma_storage.p.c[4,q], quad.prog = TRUE)
+  
+  ## (5) JS Odds
+  probs$prob.js.true.sigma_o <- JS_sigma(probs$p.tilde, sigma_storage.odds.c[1,q])
+  probs$odds.js.true.sigma_o <- probs$prob.js.true.sigma_o / (1-probs$prob.js.true.sigma_o)
+  probs$prob.js.mle.sigma_o <- JS_sigma(probs$p.tilde, sigma_storage.odds.c[2,q])
+  probs$odds.js.mle.sigma_o <- probs$prob.js.mle.sigma_o / (1-probs$prob.js.mle.sigma_o)
+
+  ## (6) JS P
+  probs$prob.js.true.sigma_p <- JS_sigma(probs$p.tilde, sigma_storage.p.c[1,q])
+  probs$odds.js.true.sigma_p <- probs$prob.js.true.sigma_p / (1-probs$prob.js.true.sigma_p)
+  probs$prob.js.mle.sigma_p <- JS_sigma(probs$p.tilde, sigma_storage.p.c[2,q])
+  probs$odds.js.mle.sigma_p <- probs$prob.js.mle.sigma_p / (1-probs$prob.js.mle.sigma_p)
+  
+  ## Empty containers for the oracle to remember to do this later
+  probs$oracle.tweedie <- rep(NA, n.prob2)
+  probs$oracle.odds.hat <- rep(NA, n.prob2)
+  probs$oracle.p.hat <- rep(NA, n.prob2)
+  
+  ## Get Error for all of our estimates against true odds
+  err.naive.odds[q] <- close.true(probs$odds, probs$odds.tilde)
+  err.tweedie.1.odds[q] <- close.true(probs$odds, probs$odds.hat.s1.odds)
+  err.tweedie.2.odds[q] <- close.true(probs$odds, probs$odds.hat.s2.odds)
+  err.tweedie.3.odds[q] <- close.true(probs$odds, probs$odds.hat.s3.odds)
+  err.tweedie.4.odds[q] <- close.true(probs$odds, probs$odds.hat.s4.odds)
+  err.js.ptrue.odds[q] <- close.true(probs$odds, probs$odds.js.true.sigma_o)
+  err.js.mle.odds[q] <- close.true(probs$odds, probs$odds.js.mle.sigma_o)
+  err.oracle.odds[q] <- close.true(probs$odds, probs$oracle.odds.hat)
+  
+  ## Get Error for all of our estimates against true p
+  err.naive.p[q] <- close.true(probs$p, probs$p.tilde)
+  err.tweedie.1.p[q] <- close.true(probs$p, probs$odds.hat.s1.p / (1+probs$odds.hat.s1.p))
+  err.tweedie.2.p[q] <- close.true(probs$p, probs$odds.hat.s2.p / (1+probs$odds.hat.s2.p))
+  err.tweedie.3.p[q] <- close.true(probs$p, probs$odds.hat.s3.p / (1+probs$odds.hat.s3.p))
+  err.tweedie.4.p[q] <- close.true(probs$p, probs$odds.hat.s4.p / (1+probs$odds.hat.s4.p))
+  err.js.ptrue.p[q] <- close.true(probs$p, probs$prob.js.true.sigma_p)
+  err.js.mle.p[q] <- close.true(probs$p, probs$prob.js.mle.sigma_p)
+  err.oracle.p[q] <- close.true(probs$p, probs$oracle.odds.hat)
+  
+  ## Store test probabilities
+  data.test[[q]] <- probs
+  
+  ## Store EC Terms
+  ec.odds.c[[q]] <- cbind(close.true.terms(probs$odds, probs$odds.tilde),
+                   close.true.terms(probs$odds, probs$odds.hat.s1.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s2.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s3.odds),
+                   close.true.terms(probs$odds, probs$odds.hat.s4.odds),
+                   close.true.terms(probs$odds, probs$odds.js.mle.sigma_o))
+  
+  ec.p.c[[q]] <- cbind(close.true.terms(probs$p, probs$p.tilde),
+                   close.true.terms(probs$p, probs$odds.hat.s1.p / (1+probs$odds.hat.s1.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s2.p / (1+probs$odds.hat.s2.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s3.p / (1+probs$odds.hat.s3.p)),
+                   close.true.terms(probs$p, probs$odds.hat.s4.p / (1+probs$odds.hat.s4.p)),
+                   close.true.terms(probs$p, probs$prob.js.mle.sigma_p))
+  
+  ## Erase later
+  print(q)
+}
+
+## Generate a summary matrix
+mean.err.matrix <- as.data.frame(matrix(nrow = 8, ncol = 6))
+colnames(mean.err.matrix) <- c("Odds.hat Mean", "Odds.hat SD Mean", "Median of Odds.hat Means", "P.hat Mean", "P.hat SD Mean", "Median of P.hat Means")
+rownames(mean.err.matrix) <- c("Naive", "Tweedie - Risk & true p", "Tweedie - Risk & MLE",
+                               "Tweedie - Grid & True p", "Tweedie - Grid & MLE", 
+                               "JS - True p", "JS - MLE",
+                               "Oracle")
+mean.err.matrix[1,] <- c(mean(err.naive.odds), sqrt((var(err.naive.odds)) / nits), median(err.naive.odds),
+                         mean(err.naive.p), sqrt((var(err.naive.p)) / nits), median(err.naive.p)) 
+mean.err.matrix[2,] <- c(mean(err.tweedie.1.odds), sqrt((var(err.tweedie.1.odds)) / nits), median(err.tweedie.1.odds),
+                         mean(err.tweedie.1.p), sqrt((var(err.tweedie.1.p)) / nits), median(err.tweedie.1.p)) 
+mean.err.matrix[3,] <- c(mean(err.tweedie.2.odds), sqrt((var(err.tweedie.2.odds)) / nits), median(err.tweedie.2.odds),
+                         mean(err.tweedie.2.p), sqrt((var(err.tweedie.2.p)) / nits), median(err.tweedie.2.p)) 
+mean.err.matrix[4,] <- c(mean(err.tweedie.3.odds), sqrt((var(err.tweedie.3.odds)) / nits), median(err.tweedie.3.odds),
+                         mean(err.tweedie.3.p), sqrt((var(err.tweedie.3.p)) / nits), median(err.tweedie.3.p)) 
+mean.err.matrix[5,] <- c(mean(err.tweedie.4.odds), sqrt((var(err.tweedie.4.odds)) / nits), median(err.tweedie.4.odds),
+                         mean(err.tweedie.4.p), sqrt((var(err.tweedie.4.p)) / nits), median(err.tweedie.4.p)) 
+mean.err.matrix[6,] <- c(mean(err.js.ptrue.odds), sqrt((var(err.js.ptrue.odds)) / nits), median(err.js.ptrue.odds),
+                         mean(err.js.ptrue.p), sqrt((var(err.js.ptrue.p)) / nits), median(err.js.ptrue.p)) 
+mean.err.matrix[7,] <- c(mean(err.js.mle.odds), sqrt((var(err.js.mle.odds)) / nits), median(err.js.mle.odds),
+                         mean(err.js.mle.p), sqrt((var(err.js.mle.p)) / nits), median(err.js.mle.p)) 
+mean.err.matrix[8,] <- c(mean(err.oracle.odds), sqrt((var(err.oracle.odds)) / nits), median(err.oracle.odds),
+                         mean(err.oracle.odds), sqrt((var(err.oracle.odds)) / nits), median(err.oracle.odds)) 
+
+err.matrix.ptilde.taylor <- kable(mean.err.matrix, caption = "Unif(0, 0.5) prior")
+print(err.matrix.ptilde.taylor)
+```

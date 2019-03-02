@@ -1,0 +1,142 @@
+---
+title: 'DSO 545: Midterm 1'
+author: "Bradley Rava"
+date: "2/21/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load packages}
+library(dplyr)
+library(ggplot2)
+library(readxl)
+```
+
+## Question 1:
+
+```{r question 1}
+## Read in the data
+b1 <- read_xlsx("b1_manhattan_coops_comp_d020118.xlsx")[-2,]
+colnames(b1) <- b1[1,]
+b1 <- b1[-1,]
+
+b2 <- read_xlsx("b2_bronx_coops_comp_d020118.xlsx")[-2,]
+colnames(b2) <- b2[1,]
+b2 <- b2[-1,]
+
+b3 <- read_xlsx("b3_brooklyn_coops_comp_d020118.xlsx")[-2,]
+colnames(b3) <- b3[1,]
+b3 <- b3[-1,]
+
+b4 <- read_xlsx("b4_queens_coops_comp_d020118.xlsx")[-2,]
+colnames(b4) <- b4[1,]
+b4 <- b4[-1,]
+
+b5 <- read_xlsx("b5_statenisland_coops_comp_d020118.xlsx")[-2,]
+colnames(b5) <- b5[1,]
+b5 <- b5[-1,]
+
+## Are all of the column names the same?
+which(colnames(b1) != colnames(b2))
+which(colnames(b2) != colnames(b3))
+which(colnames(b3) != colnames(b4))
+which(colnames(b4) != colnames(b5))
+
+## Create a new dataframe with the combined information
+CondosNYC <- rbind.data.frame(b1, b2, b3, b4, b5)
+
+## We only want a subset of these columns 
+CondosNYC <- CondosNYC[,3:14]
+
+
+## Add Boro manually
+colnames(CondosNYC) <- c("Neighborhood", "Class", "Units", "YearBuilt", "Sqft",
+                         "Income", "IncomePerSqFt", "Expense", "ExpensePerSqFt",
+                         "NetIncome", "Value", "ValuePerSqFt")
+
+## Add the Boro variable
+CondosNYC$Boro <- c(rep("Manhattan", nrow(b1)), rep("Bronx", nrow(b2)), rep("Brooklyn", nrow(b3)), 
+                    rep("Queens", nrow(b4)), rep("Staten Island", nrow(b5)))
+
+## Report the number of rows and columns and head of the table
+dim(CondosNYC)
+head(CondosNYC)
+```
+
+## Question 2
+
+```{r q2 graph1}
+ggplot(CondosNYC, aes(x=as.numeric(CondosNYC$ValuePerSqFt))) + 
+  geom_histogram(binwidth=10) + labs(x="Value per square Foot")
+```
+
+## Question 3
+```{r q2 graph2}
+ggplot(CondosNYC, aes(x=as.numeric(CondosNYC$ValuePerSqFt), group=CondosNYC$Boro, fill=CondosNYC$Boro, na.rm=TRUE)) +
+  geom_histogram(position="identity",binwidth=10) +
+  labs(x="Value per square Foot")
+```
+
+## Question 4
+```{r q2 graph3}
+ggplot(CondosNYC, aes(x=as.numeric(CondosNYC$ValuePerSqFt), fill=CondosNYC$Boro, na.rm=TRUE)) + 
+  geom_histogram(binwidth = 10)+
+  facet_grid(~CondosNYC$Boro) +
+  labs(x="Value per square Foot")
+```
+
+```{r q2 graph4}
+ggplot(CondosNYC, aes(x=as.numeric(CondosNYC$Sqft), y=as.numeric(CondosNYC$ValuePerSqFt))) +
+  geom_point(size=2) +
+  labs(x="SqFt", y="ValuePerSqft")
+```
+
+```{r q2 graph5}
+ggplot(CondosNYC, aes(x=as.numeric(CondosNYC$Units), y=as.numeric(CondosNYC$ValuePerSqFt))) +
+  geom_point(size=2) +
+  labs(x="Units", y="ValuePerSqft")
+```
+
+```{r q2 graph6}
+ggplot(CondosNYC[CondosNYC$Units < 1000,], aes(x=as.numeric(CondosNYC[CondosNYC$Units < 1000,]$Sqft), y=as.numeric(CondosNYC[CondosNYC$Units < 1000,]$ValuePerSqFt))) +
+  geom_point(size=2) +
+  labs(x="SqFt", y="ValuePerSqft")
+```
+
+```{r q2 graph7}
+ggplot(CondosNYC[CondosNYC$Units < 1000, ], aes(x=as.numeric(CondosNYC[CondosNYC$Units < 1000, ]$Units), y=as.numeric(CondosNYC[CondosNYC$Units < 1000, ]$ValuePerSqFt))) +
+  geom_point(size=2) +
+  labs(x="Units", y="ValuePerSqft")
+```
+
+
+## Question 5
+These graphs are useful because they tell us thing like how the value per square footage changes throughout the buros of NY. This could be useful to someone looking to buy a home, an investor, or a social scientist. We are able to see this holistically throughout all of the buros (to get a good picture of NY) and then in each of the buros specifically so that we can see the differences within NY and the effects each buro individually faces.
+
+It is also useful to look at this and compare it to the plots where we only have number of units less than 1000. 
+
+We are also able to see how sqft trands with value per sqft, we well that how units impact value per sqft. This would be good for prediction later on.
+
+## Question 6
+```{r q6}
+stats <- aggregate(as.numeric(CondosNYC$Value), by=list(CondosNYC$Boro), summary)
+print(stats)
+```
+
+## Question 7
+```{r q6}
+stats2 <- aggregate(as.numeric(CondosNYC$Value[CondosNYC$Units > 100]), by=list(CondosNYC$Boro[CondosNYC$Units > 100], CondosNYC$Class[CondosNYC$Units > 100]), summary)
+print(stats2)
+```
+
+## Question 8
+```{r q8}
+largest_nbd <- aggregate(CondosNYC$Neighborhood, by=list(CondosNYC$Boro), length)
+print(largest_nbd)
+```
+Manhattan has the largest number of neighborhoods where the number of neighborhoods is 2505. 
+
